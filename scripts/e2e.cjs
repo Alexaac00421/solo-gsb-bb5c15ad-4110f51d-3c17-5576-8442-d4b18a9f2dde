@@ -1718,6 +1718,17 @@ async function main() {
   await J(`/api/rehearsals/${rhL1}/switch-version`, director, { versionId: pv2 }, 200);
   const chk1AfterSw = await G(`/api/prop-checkouts/${chk1Id}`, director);
   check('换版不抹除领还流水', chk1AfterSw.checkout.id === chk1Id && chk1AfterSw.checkout.custodian.actorId === linId);
+  // 幂等重放冻结首次回执：chk1 已历经分批归还、损坏核销（整单结清）、改派与换版，
+  // 同号同内容重试仍返回首次响应（快照），而非变化后的实时状态
+  const chk1ReplayLate = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, chkBody, 200);
+  check('历经归还/核销/改派/换版后重放仍返回首次回执（与首次响应逐字段一致）',
+    chk1ReplayLate.idempotentReplay === true
+      && JSON.stringify(chk1ReplayLate.checkout) === JSON.stringify(chk1.checkout),
+    JSON.stringify(chk1ReplayLate.checkout));
+  check('重放回执冻结首次办理时状态（未归还 3 件、无归还流水）',
+    chk1ReplayLate.checkout.status === 'outstanding'
+      && chk1ReplayLate.checkout.totalOutstanding === 3
+      && chk1ReplayLate.checkout.returns.length === 0);
 
   console.log('— 道具领还：演员仅查看本人领还流水 / 下调库存守卫 —');
   const linFlow = await G('/api/me/prop-checkouts', lin);
@@ -1746,6 +1757,63 @@ async function main() {
   await J(`/api/prop-checkouts/${zhouChkId}/returns`, director, { items: [{ propId: propBellL, good: 1 }] }, 201);
   await req('PATCH', `/api/props/${propBellL}`, director, { totalCount: 1 }, 200);
   check('归还降低未归还量后可下调库存', true);
+
+  console.log('— 道具领用：首次回执快照（归还/调期/改名/取消后重放不变；失败不占号）—');
+  const propRcpt = (await J('/api/props', director, { name: '回执灯笼E2E', totalCount: 2 }, 201)).prop.id;
+  const propRcpt2 = (await J('/api/props', director, { name: '回执铜锣E2E', totalCount: 1 }, 201)).prop.id;
+  const L6 = (await J(`/api/rehearsals/${rhL2}/schedules`, director,
+    { sceneId: sc1, startAt: '2036-02-01T10:00:00Z', endAt: '2036-02-01T11:00:00Z' }, 201)).schedule;
+  await req('PUT', `/api/rehearsals/${rhL2}/schedules/${L6.id}/props`, director,
+    { items: [{ propId: propRcpt, quantity: 2 }, { propId: propRcpt2, quantity: 1 }] }, 200);
+  // 失败不占用请求号：超本时段预约量（预约 2 领 3）-> 409 整次不生效；同号修正内容后 -> 201 首次创建
+  const rcptFail = await J(`/api/rehearsals/${rhL2}/schedules/${L6.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-RCPT', custodianActorId: zhouId, items: [{ propId: propRcpt, quantity: 3 }] }, 409);
+  check('失败请求（超预约量）整次不生效', rcptFail.error === 'PROP_CHECKOUT_EXCEEDS_RESERVATION');
+  const rcptBody = {
+    requestId: 'CHK-E2E-RCPT', custodianActorId: zhouId, note: '回执快照',
+    items: [{ propId: propRcpt, quantity: 2 }, { propId: propRcpt2, quantity: 1 }],
+  };
+  const rcpt1 = await J(`/api/rehearsals/${rhL2}/schedules/${L6.id}/prop-checkouts`, director, rcptBody, 201);
+  check('失败不占用请求号：同号修正后按首次创建成功（201 + idempotentReplay:false）',
+    rcpt1.ok && rcpt1.idempotentReplay === false && rcpt1.checkout.totalOutstanding === 3, JSON.stringify(rcpt1));
+  const rcptId = rcpt1.checkout.id;
+  // 后续变更：分批归还 + 时段调期 + 道具改名 + 取消时段
+  await J(`/api/prop-checkouts/${rcptId}/returns`, director, { items: [{ propId: propRcpt, good: 1 }] }, 201);
+  await req('PATCH', `/api/rehearsals/${rhL2}/schedules/${L6.id}`, director,
+    { startAt: '2036-02-02T10:00:00Z', endAt: '2036-02-02T11:00:00Z' }, 200);
+  await req('PATCH', `/api/props/${propRcpt}`, director, { name: '回执灯笼E2E改' }, 200);
+  await J(`/api/rehearsals/${rhL2}/schedules/${L6.id}/cancel`, director, {}, 200);
+  // 同号同内容重试（明细顺序不同）：仍返回首次响应快照，不受后续变更影响
+  const rcptReplay = await J(`/api/rehearsals/${rhL2}/schedules/${L6.id}/prop-checkouts`, director,
+    { ...rcptBody, items: [rcptBody.items[1], rcptBody.items[0]] }, 200);
+  check('归还/调期/改名/取消后同号重放仍返回首次回执（逐字段一致）',
+    rcptReplay.idempotentReplay === true
+      && JSON.stringify(rcptReplay.checkout) === JSON.stringify(rcpt1.checkout),
+    JSON.stringify(rcptReplay.checkout));
+  check('快照冻结首次办理时内容（状态/未归还量/时段/道具名）',
+    rcptReplay.checkout.status === 'outstanding'
+      && rcptReplay.checkout.totalOutstanding === 3
+      && rcptReplay.checkout.returns.length === 0
+      && rcptReplay.checkout.schedule.status === 'active'
+      && rcptReplay.checkout.schedule.startAt === '2036-02-01T10:00:00.000Z'
+      && rcptReplay.checkout.items.find((i) => i.propId === propRcpt).propName === '回执灯笼E2E');
+  const rcptDiff = await J(`/api/rehearsals/${rhL2}/schedules/${L6.id}/prop-checkouts`, director,
+    { ...rcptBody, note: '异内容' }, 409);
+  check('快照机制下同号异内容仍拒绝（409 REQUEST_ID_CONFLICT）', rcptDiff.error === 'REQUEST_ID_CONFLICT');
+  // 实时视图（详情/责任清单/本人流水）继续展示最新归还与时段状态，不取快照
+  const rcptDetail = await G(`/api/prop-checkouts/${rcptId}`, director);
+  check('领用详情展示最新归还与时段状态（不取快照）',
+    rcptDetail.checkout.totalOutstanding === 2
+      && rcptDetail.checkout.returns.length === 1
+      && rcptDetail.checkout.schedule.status === 'cancelled'
+      && rcptDetail.checkout.schedule.startAt === '2036-02-02T10:00:00.000Z'
+      && rcptDetail.checkout.items.find((i) => i.propId === propRcpt).propName === '回执灯笼E2E改',
+    JSON.stringify(rcptDetail.checkout));
+  const rcptLiab = await G('/api/prop-checkouts?status=outstanding', director);
+  check('责任清单展示最新未归还量', rcptLiab.checkouts.find((c) => c.id === rcptId).totalOutstanding === 2);
+  const zhouRcpt = (await G('/api/me/prop-checkouts', zhou)).checkouts.find((c) => c.id === rcptId);
+  check('本人流水展示最新归还记录与道具名',
+    zhouRcpt.returns.length === 1 && zhouRcpt.items.find((i) => i.propId === propRcpt).propName === '回执灯笼E2E改');
 
   console.log('— 临时替角：设置 / 替换 / 撤回与最终参与者、通知 —');
   {

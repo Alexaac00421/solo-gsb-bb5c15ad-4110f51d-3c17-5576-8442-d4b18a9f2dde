@@ -18,6 +18,8 @@ db.exec(schema);
 /**
  * 轻量结构迁移：PRAGMA user_version 单调递增。
  * v1 -> v2：confirmations 唯一键加入 actor_id（改派保留历史确认）。
+ * v2 -> v3：prop_checkouts 增加 response_snapshot（首次成功响应的 checkout 冻结快照，
+ *           供幂等重放原样返回；既有领用单保持 NULL，重放仍按当前状态实时返回）。
  */
 function migrate() {
   const from = db.pragma('user_version', { simple: true });
@@ -58,6 +60,14 @@ function migrate() {
       db.pragma('foreign_keys = ON');
     }
     db.pragma('user_version = 2');
+  }
+  if (from < 3) {
+    // 全新库的 schema.sql 已含该列；仅对既有库补列（幂等守卫）
+    const cols = db.prepare("PRAGMA table_info('prop_checkouts')").all();
+    if (!cols.some((c) => c.name === 'response_snapshot')) {
+      db.exec('ALTER TABLE prop_checkouts ADD COLUMN response_snapshot TEXT');
+    }
+    db.pragma('user_version = 3');
   }
 }
 migrate();

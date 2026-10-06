@@ -14,7 +14,10 @@ const { isScheduleParticipant, computePropShortages, unreturnedCheckoutTotals } 
  *   - 跨时段未归还总量（领用 − 完好归还 − 损坏核销）不得超过道具现有库存
  *     （409 PROP_STOCK_INSUFFICIENT）；任一项不合格整次不生效（同一事务）。
  *   - 幂等请求号 requestId（全局唯一）：同号同内容重试返回首次结果（200，idempotentReplay）；
- *     同号异内容拒绝（409 REQUEST_ID_CONFLICT）。
+ *     同号异内容拒绝（409 REQUEST_ID_CONFLICT）；失败请求不占用请求号。
+ *   - 首次成功事务中冻结首次响应的 checkout 内容（response_snapshot）：之后的分批归还、
+ *     损坏核销、时段调期/取消、道具改名等均不改变重放回执；无快照的既有领用单重放时
+ *     仍按当前状态实时返回（不伪造历史回执）。
  *
  * 归还（导演，按原领用记录分批登记）：
  *   - 一批可含该单多个道具的完好归还（good）与损坏（damaged）件数；
@@ -172,6 +175,15 @@ function checkoutRequestHash(payload) {
   return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
+/**
+ * 幂等重放时返回的 checkout：有冻结快照（首次成功事务中写入）则原样返回，
+ * 保证与首次响应逐字段一致；无快照的既有领用单沿用当前状态实时序列化（不伪造历史回执）。
+ */
+function checkoutForReplay(row) {
+  if (row.response_snapshot) return JSON.parse(row.response_snapshot);
+  return serializeCheckout(row, { withReturns: true });
+}
+
 // ---- 导演：办理领用（幂等 requestId；整次生效/整次不生效） ----
 router.post(
   '/rehearsals/:id/schedules/:scheduleId/prop-checkouts',
@@ -220,7 +232,7 @@ router.post(
           requestId,
         });
       }
-      return res.json({ ok: true, idempotentReplay: true, checkout: serializeCheckout(existing, { withReturns: true }) });
+      return res.json({ ok: true, idempotentReplay: true, checkout: checkoutForReplay(existing) });
     }
 
     // —— 业务校验 ——
@@ -287,7 +299,7 @@ router.post(
       throw conflict('PROP_STOCK_INSUFFICIENT', '跨时段未归还总量将超过现有库存，本次领用整次不生效', { insufficient });
     }
 
-    const checkoutId = transaction(() => {
+    const created = transaction(() => {
       // 事务内复查请求号（UNIQUE 约束兜底并发重试）
       const dup = db.prepare('SELECT id FROM prop_checkouts WHERE request_id = ?').get(requestId);
       if (dup) throw conflict('REQUEST_ID_CONFLICT', `请求号「${requestId}」已被使用`, { requestId });
@@ -299,11 +311,13 @@ router.post(
         .run(requestId, hash, scheduleId, r.id, custodianActorId, note, req.user.id).lastInsertRowid;
       const ins = db.prepare('INSERT INTO prop_checkout_items (checkout_id, prop_id, quantity) VALUES (?, ?, ?)');
       for (const { propId, quantity } of parsed) ins.run(id, propId, quantity);
-      return id;
+      // 同一成功事务内冻结首次响应的 checkout 内容：之后的归还/核销/调期/取消/改名
+      // 均不改变幂等重放的回执；本响应即返回该快照对象，保证首次与重放逐字段一致。
+      const snapshot = serializeCheckout(getCheckoutRowOrThrow(id), { withReturns: true });
+      db.prepare('UPDATE prop_checkouts SET response_snapshot = ? WHERE id = ?').run(JSON.stringify(snapshot), id);
+      return { id, snapshot };
     });
-    res
-      .status(201)
-      .json({ ok: true, idempotentReplay: false, checkout: serializeCheckout(getCheckoutRowOrThrow(checkoutId), { withReturns: true }) });
+    res.status(201).json({ ok: true, idempotentReplay: false, checkout: created.snapshot });
   })
 );
 
