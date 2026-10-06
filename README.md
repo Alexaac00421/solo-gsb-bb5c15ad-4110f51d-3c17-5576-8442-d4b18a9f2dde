@@ -216,9 +216,17 @@
      （`409 PROP_STOCK_INSUFFICIENT`，`details.insufficient` 给出库存/未归还/本次/可申请）；
    - 已取消与待调整时段不能办理领用（`400`）；保管人不是该时段当前参与演员、未知道具、
      无效件数、同批重复道具等一律 `400` 明确拒绝。
-2. **幂等请求号**：领用请求必须携带全局唯一的 `requestId`。**同号同内容**重试返回首次结果
-   （`200`，`idempotentReplay: true`，不产生新单；明细顺序差异视为同内容）；
-   **同号异内容**拒绝（`409 REQUEST_ID_CONFLICT`）。
+2. **幂等请求号**：领用请求必须携带全局唯一的 `requestId`。
+   - **首次创建**返回 `201`、`idempotentReplay: false`；**同号同内容**重试返回 `200`、
+     `idempotentReplay: true`，不产生新单（**明细顺序差异视为同内容**，按道具归一化比对）；
+     **同号异内容**拒绝（`409 REQUEST_ID_CONFLICT`）。
+   - **首次回执冻结**：新领用的首次成功响应（完整 `checkout` 视图）在**成功事务中冻结**。
+     之后无论发生**分批归还、损坏核销、时段调期/取消、道具改名**，同号同内容重试返回的
+     `checkout` 都与首次响应**逐字段一致**（仍是当时的保管人、时段状态、道具名、未归还量与空归还流水），
+     可作为首次办理回执；**领用详情、责任清单与演员本人流水不读快照，继续展示最新归还与时段状态**。
+   - **失败不占用请求号**：业务校验失败（如超预约量、库存不足、时段无效）不写入任何记录，
+     同一 `requestId` 改为合法内容后仍可首次成功；**旧版无快照领用单**（冻结列升级前已存在）
+     重放时沿用当前实时结果，不伪造历史回执。
 3. **分批归还**：导演按原领用记录分批登记**完好归还**（`good`）与**损坏**（`damaged`）件数
    （`POST /api/prop-checkouts/:id/returns`，一批可含该单多个道具）；
    同一（领用单 × 道具）的**累计归还（完好 + 损坏）不得超过未归还量**
@@ -378,7 +386,7 @@ PORT=8080 docker compose up --build -d
 | GET/PUT | `/api/rehearsals/:id/schedules/:sid/props` | 查看时段预约与最低余量（演员仅限本人参与的有效时段且只见清单）/ 填写道具目标件数（导演；`quantity=0` 撤销，未列出的道具不变） |
 | POST | `/api/schedules/props/batch` | 批量修改多个时段的道具预约（导演，至少两条，可跨排练）：整批最终状态校验，任一时刻不足整批不生效，返回道具/冲突时段/缺口 |
 | GET | `/api/props/shortages` | 库存缺口清单（导演）：损坏核销扣减总库存后，既有有效预约超量的道具（预约保留，含峰值时刻/缺口/冲突时段） |
-| POST | `/api/rehearsals/:id/schedules/:sid/prop-checkouts` | 办理道具领用（导演，仅有效时段）：指定该时段当前参与演员为保管人；本时段累计领用≤预约量、跨时段未归还≤现有库存，任一不合格整次不生效；幂等 `requestId`（同号同内容重试返回原结果，同号异内容 409） |
+| POST | `/api/rehearsals/:id/schedules/:sid/prop-checkouts` | 办理道具领用（导演，仅有效时段）：指定该时段当前参与演员为保管人；本时段累计领用≤预约量、跨时段未归还≤现有库存，任一不合格整次不生效；幂等 `requestId`（首次 `201 idempotentReplay:false`，成功事务中冻结首次回执；同号同内容重试 `200 idempotentReplay:true` 回放冻结快照，明细顺序差异视为同内容；同号异内容 `409 REQUEST_ID_CONFLICT`；失败不占用请求号；旧版无快照单沿用实时结果） |
 | GET | `/api/rehearsals/:id/schedules/:sid/prop-checkouts` | 该时段的领用记录（导演；含各道具领用/已还/未还量） |
 | GET | `/api/prop-checkouts` | 领用责任清单（导演；`?status=outstanding|cleared` 过滤）：保管人、时段（含已取消/待调整实时状态）、各道具未归还量 |
 | GET | `/api/prop-checkouts/:id` | 领用单详情（导演；含完整归还流水） |
@@ -946,17 +954,46 @@ curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkout
 #                                          "requested":1,"available":0,...}]}}
 #    - 已取消/待调整时段、保管人非该时段当前参与演员、未知道具/无效件数/重复道具 -> 400
 
-# 3. 幂等：同号同内容重试 -> 200 返回首次结果（不产生新单）；同号异内容 -> 409
+# 3. 幂等：同号同内容重试 -> 200 回放首次冻结回执（不产生新单）；同号异内容 -> 409
+#    首次成功响应已在成功事务中冻结；明细顺序打乱仍视为同内容
 curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
   -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
   -d '{"requestId":"CHK-20261006-001","custodianActorId":2,"note":"首演联排领用",
-       "items":[{"propId":1,"quantity":1},{"propId":2,"quantity":1}]}'
-# -> 200 {"ok":true,"idempotentReplay":true,"checkout":{"id":1, ...同首次...}}
+       "items":[{"propId":2,"quantity":1},{"propId":1,"quantity":1}]}'
+# -> 200 {"ok":true,"idempotentReplay":true,
+#        "checkout":{...与第 2 步 201 响应的 checkout 逐字段一致（status:"outstanding",
+#                    totalOutstanding:2, returns:[], 道具名仍为首次名称, schedule.status:"active")}}
 curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
   -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
   -d '{"requestId":"CHK-20261006-001","custodianActorId":2,"items":[{"propId":1,"quantity":2}]}'
 # -> 409 {"error":"REQUEST_ID_CONFLICT",
 #        "message":"请求号「CHK-20261006-001」已被不同内容的领用请求使用，本次请求被拒绝"}
+# 3b. 冻结语义：即使此后分批归还、损坏核销、时段调期/取消、道具改名，
+#     同号同内容重试仍是首次回执；而详情/责任清单/本人流水展示最新状态
+curl -s -X PATCH http://localhost:3000/api/props/1 \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"name":"煤油灯（已改名）"}'
+curl -s -X POST http://localhost:3000/api/prop-checkouts/1/returns \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"items":[{"propId":1,"good":1},{"propId":2,"damaged":1}]}'   # 归还 + 损坏核销
+curl -s http://localhost:3000/api/prop-checkouts/1 -H "Authorization: Bearer <TOKEN>"
+# -> 详情为实时状态：status:"cleared", totalOutstanding:0, returns:[...2 条...],
+#    items[0].propName:"煤油灯（已改名）", items[1].returnedDamaged:1
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"requestId":"CHK-20261006-001","custodianActorId":2,"note":"首演联排领用",
+       "items":[{"propId":1,"quantity":1},{"propId":2,"quantity":1}]}'
+# -> 200 idempotentReplay:true，checkout 仍是首次回执：
+#    status:"outstanding", totalOutstanding:2, returns:[], propName:"煤油灯", schedule.status:"active"
+# 3c. 失败不占用请求号：超预约量/库存不足等 409 不写入；同一 requestId 改为合法内容仍 201
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"requestId":"CHK-RETRY-001","custodianActorId":2,"items":[{"propId":1,"quantity":9}]}'
+# -> 409 PROP_CHECKOUT_EXCEEDS_RESERVATION（请求号未被占用）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/prop-checkouts \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"requestId":"CHK-RETRY-001","custodianActorId":2,"items":[{"propId":1,"quantity":1}]}'
+# -> 201 {"ok":true,"idempotentReplay":false,"checkout":{...首次成功回执...}}
 
 # 4. 分批归还：按原领用记录登记完好/损坏件数（累计不得超过未归还量）
 curl -s -X POST http://localhost:3000/api/prop-checkouts/1/returns \
@@ -1217,7 +1254,9 @@ curl -s http://localhost:3000/api/settlements -H "Authorization: Bearer <ACTOR_T
 半开区间与端点相接、撤销(0)与未列出项不变、整批最终状态校验与回滚、调期与批量调期携带预约移动超占整体不生效、
 取消/转待调整释放占用、恢复有效重新校验、演员仅见本人参与有效时段清单且越权 403、日程列表 props 简表）、
 道具领用与归还（有效时段领用与保管人校验、本时段预约量与跨时段未归还库存双上限整次拒绝、
-幂等请求号同号同内容重放/同号异内容拒绝、分批归还与超未归还量拒绝、损坏核销扣减总库存、
+幂等请求号首次 201 且成功事务冻结首次回执、同号同内容（明细顺序归一化）重放冻结快照/同号异内容 409/失败不占用请求号、
+归还损坏改名调期取消后重放仍与首次响应一致而详情责任清单本人流水展示最新、旧版无快照单沿用实时结果、
+分批归还与超未归还量拒绝、损坏核销扣减总库存、
 核销后预约超量保留并显示缺口且后续预约/调期按新库存校验、取消/改派/换版不抹除流水与责任、
 下调库存不得低于未归还量、演员仅见本人领还流水）、
 临时替角（设置/替换/撤回与最终参与者返回；无效时段/角色/非演员/本人替补/缺原因拒绝；同角色同时段一个替角；
@@ -1256,8 +1295,9 @@ src/
                    半开区间库存扫描线）、容量冲突（道具/冲突时段/缺口）、调期集成校验、
                    库存缺口清单、时段领用进度、演员可见性
   prop-checkouts.js 道具领用与归还：有效时段实物领用（保管人=当前参与演员，预约量/未归还库存双上限，
-                   幂等请求号同号同内容重放/同号异内容拒绝）、分批归还（完好+损坏，损坏核销扣减总库存，
-                   核销后缺口随响应返回）、责任清单与演员本人流水；流水只增不改
+                   幂等请求号：首次 201 在成功事务冻结回执快照，同号同内容（明细顺序归一化）200 重放冻结快照、
+                   同号异内容 409、失败不占用请求号、旧版无快照沿用实时结果）、分批归还（完好+损坏，损坏核销扣减总库存，
+                   核销后缺口随响应返回）、责任清单与演员本人流水（展示最新归还与时段状态）；流水只增不改
   substitutes.js   单时段临时替角：设置/替换/撤回（签到开启前）、最终参与者返回、替角本场台词；
                    失效与重校验由 schedules.js/rehearsals.js 在调期/改派/换版/取消事务内完成
   settlements.js   演员劳务结算：费率维护（分/小时非负整数）、可结算登记清单、只读预演、

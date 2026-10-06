@@ -14,7 +14,10 @@ const { isScheduleParticipant, computePropShortages, unreturnedCheckoutTotals } 
  *   - 跨时段未归还总量（领用 − 完好归还 − 损坏核销）不得超过道具现有库存
  *     （409 PROP_STOCK_INSUFFICIENT）；任一项不合格整次不生效（同一事务）。
  *   - 幂等请求号 requestId（全局唯一）：同号同内容重试返回首次结果（200，idempotentReplay）；
- *     同号异内容拒绝（409 REQUEST_ID_CONFLICT）。
+ *     同号异内容拒绝（409 REQUEST_ID_CONFLICT）。首次成功响应在成功事务中冻结为回执快照
+ *     （prop_checkouts.response_snapshot）：之后的分批归还、损坏核销、时段调期/取消、
+ *     道具改名均不改变重放内容；旧版无快照（snapshot 为 NULL）的领用单重放沿用当前实时结果，
+ *     不伪造历史回执。失败请求不占用请求号（校验全部先于插入，回滚即释放）。
  *
  * 归还（导演，按原领用记录分批登记）：
  *   - 一批可含该单多个道具的完好归还（good）与损坏（damaged）件数；
@@ -172,6 +175,22 @@ function checkoutRequestHash(payload) {
   return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
+/**
+ * 读取成功事务中冻结的“首次办理回执”。
+ * 有快照：即使之后发生分批归还/损坏核销/调期取消/道具改名，重放仍与首次响应逐字一致；
+ * 无快照（response_snapshot 为 NULL 的旧版领用单）：沿用当前实时视图，不伪造历史回执。
+ */
+function frozenCheckoutSnapshot(row) {
+  if (row.response_snapshot) {
+    try {
+      return JSON.parse(row.response_snapshot);
+    } catch {
+      // 快照内容异常时退化为实时视图，保证接口可用
+    }
+  }
+  return serializeCheckout(row, { withReturns: true });
+}
+
 // ---- 导演：办理领用（幂等 requestId；整次生效/整次不生效） ----
 router.post(
   '/rehearsals/:id/schedules/:scheduleId/prop-checkouts',
@@ -220,7 +239,8 @@ router.post(
           requestId,
         });
       }
-      return res.json({ ok: true, idempotentReplay: true, checkout: serializeCheckout(existing, { withReturns: true }) });
+      // 同号同内容重放：返回成功事务中冻结的首次回执（明细顺序差异已在指纹阶段归一化）
+      return res.json({ ok: true, idempotentReplay: true, checkout: frozenCheckoutSnapshot(existing) });
     }
 
     // —— 业务校验 ——
@@ -287,7 +307,7 @@ router.post(
       throw conflict('PROP_STOCK_INSUFFICIENT', '跨时段未归还总量将超过现有库存，本次领用整次不生效', { insufficient });
     }
 
-    const checkoutId = transaction(() => {
+    const snapshot = transaction(() => {
       // 事务内复查请求号（UNIQUE 约束兜底并发重试）
       const dup = db.prepare('SELECT id FROM prop_checkouts WHERE request_id = ?').get(requestId);
       if (dup) throw conflict('REQUEST_ID_CONFLICT', `请求号「${requestId}」已被使用`, { requestId });
@@ -299,11 +319,12 @@ router.post(
         .run(requestId, hash, scheduleId, r.id, custodianActorId, note, req.user.id).lastInsertRowid;
       const ins = db.prepare('INSERT INTO prop_checkout_items (checkout_id, prop_id, quantity) VALUES (?, ?, ?)');
       for (const { propId, quantity } of parsed) ins.run(id, propId, quantity);
-      return id;
+      // 成功事务中冻结首次办理回执：与 201 响应的 checkout 同源同内容
+      const frozen = serializeCheckout(getCheckoutRowOrThrow(id), { withReturns: true });
+      db.prepare('UPDATE prop_checkouts SET response_snapshot = ? WHERE id = ?').run(JSON.stringify(frozen), id);
+      return frozen;
     });
-    res
-      .status(201)
-      .json({ ok: true, idempotentReplay: false, checkout: serializeCheckout(getCheckoutRowOrThrow(checkoutId), { withReturns: true }) });
+    res.status(201).json({ ok: true, idempotentReplay: false, checkout: snapshot });
   })
 );
 

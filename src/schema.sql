@@ -379,6 +379,10 @@ CREATE INDEX IF NOT EXISTS idx_prop_reservations_schedule ON prop_reservations(s
 -- 道具领用单：导演从“有效（active）时段”的预约中办理实物领用，指定该时段当前参与演员为保管人。
 --   * request_id 为幂等请求号（全局唯一）：同号同内容重试返回首次结果；同号异内容拒绝（409）。
 --     request_hash 为请求内容指纹（排练/时段/保管人/明细/备注归一化后的 SHA-256）。
+--   * response_snapshot 为成功事务中冻结的“首次办理回执”（完整 checkout 视图 JSON）：
+--     之后分批归还、损坏核销、时段调期/取消、道具改名等变化均不影响同号同内容重试，
+--     重放一律返回该冻结快照（200, idempotentReplay:true）；NULL 为旧版无快照领用单，
+--     重放时按当前实时状态返回（不伪造历史回执）。
 --   * 各道具“本时段累计领用量”不得超过该时段预约量；跨时段“未归还总量”
 --     （领用 − 完好归还 − 损坏核销）不得超过道具现有库存；任一项不合格整次不生效。
 --   * 保管人在办理时冻结（custodian_actor_id）：之后的取消/转待调整/改派/换版均不改写
@@ -387,6 +391,7 @@ CREATE TABLE IF NOT EXISTS prop_checkouts (
   id                 INTEGER PRIMARY KEY,
   request_id         TEXT NOT NULL UNIQUE,
   request_hash       TEXT NOT NULL,
+  response_snapshot  TEXT,
   schedule_id        INTEGER NOT NULL REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
   rehearsal_id       INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
   custodian_actor_id INTEGER NOT NULL REFERENCES users(id),

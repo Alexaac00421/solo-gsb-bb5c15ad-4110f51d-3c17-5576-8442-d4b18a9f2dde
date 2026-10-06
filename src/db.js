@@ -18,6 +18,7 @@ db.exec(schema);
 /**
  * 轻量结构迁移：PRAGMA user_version 单调递增。
  * v1 -> v2：confirmations 唯一键加入 actor_id（改派保留历史确认）。
+ * v2 -> v3：prop_checkouts 增加 response_snapshot（冻结首次领用回执，幂等重放不再受后续状态变化影响）。
  */
 function migrate() {
   const from = db.pragma('user_version', { simple: true });
@@ -58,6 +59,14 @@ function migrate() {
       db.pragma('foreign_keys = ON');
     }
     db.pragma('user_version = 2');
+  }
+  if (from < 3) {
+    // 既有领用单不回填快照：NULL 表示旧版无快照，重放沿用当前实时结果（不伪造历史回执）
+    const cols = db.prepare('PRAGMA table_info(prop_checkouts)').all();
+    if (!cols.some((c) => c.name === 'response_snapshot')) {
+      db.exec('ALTER TABLE prop_checkouts ADD COLUMN response_snapshot TEXT');
+    }
+    db.pragma('user_version = 3');
   }
 }
 migrate();

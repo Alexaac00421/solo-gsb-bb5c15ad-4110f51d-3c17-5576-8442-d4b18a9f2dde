@@ -1632,12 +1632,34 @@ async function main() {
     && exStock.details.insufficient[0].totalCount === 2
     && exStock.details.insufficient[0].available === 0, JSON.stringify(exStock.details));
 
+  // 失败不得占用请求号：超预约量 409 后，同号改为合法内容应能成功（而不是 REQUEST_ID_CONFLICT）
+  const propRetry = (await J('/api/props', director, { name: '领用重试道具E2E', totalCount: 1 }, 201)).prop.id;
+  await req('PUT', `/api/rehearsals/${rhL1}/schedules/${L1.id}/props`, director,
+    { items: [{ propId: propLampL, quantity: 2 }, { propId: propDrumL, quantity: 1 }, { propId: propBellL, quantity: 1 }, { propId: propRetry, quantity: 1 }] }, 200);
+  const failBody = { requestId: 'CHK-E2E-FAIL1', custodianActorId: linId, items: [{ propId: propRetry, quantity: 2 }] };
+  const failOnce = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director, failBody, 409);
+  check('首次超预约量失败 -> 409 PROP_CHECKOUT_EXCEEDS_RESERVATION',
+    failOnce.error === 'PROP_CHECKOUT_EXCEEDS_RESERVATION');
+  const failRetry = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director,
+    { ...failBody, items: [{ propId: propRetry, quantity: 1 }] }, 201);
+  check('失败不占用请求号：同号改为合法内容后首次成功 201/idempotentReplay:false',
+    failRetry.ok && failRetry.idempotentReplay === false
+      && failRetry.checkout.requestId === 'CHK-E2E-FAIL1'
+      && failRetry.checkout.items[0].propId === propRetry
+      && failRetry.checkout.items[0].outstanding === 1, JSON.stringify(failRetry));
+  const failRetryId = failRetry.checkout.id;
+  const failReplay = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director,
+    { ...failBody, items: [{ propId: propRetry, quantity: 1 }] }, 200);
+  check('成功后同号同内容重试 -> 200 重放（不产生第二张单）',
+    failReplay.idempotentReplay === true && failReplay.checkout.id === failRetryId);
+
   // 责任清单 / 登记册 / 详情 / 权限
   const liability = await G('/api/prop-checkouts?status=outstanding', director);
   check('责任清单：未归还领用单（含保管人与各道具未归还量）',
-    liability.checkouts.length === 3
+    liability.checkouts.length === 4
       && liability.checkouts.every((c) => c.status === 'outstanding')
-      && liability.checkouts.some((c) => c.id === chk1Id && c.custodian.actorId === linId && c.totalOutstanding === 3),
+      && liability.checkouts.some((c) => c.id === chk1Id && c.custodian.actorId === linId && c.totalOutstanding === 3)
+      && liability.checkouts.some((c) => c.id === failRetryId && c.totalOutstanding === 1),
     JSON.stringify(liability.checkouts.map((x) => [x.id, x.totalOutstanding])));
   await G('/api/prop-checkouts?status=bogus', director, 400);
   await G('/api/prop-checkouts', lin, 403);
@@ -1719,12 +1741,49 @@ async function main() {
   const chk1AfterSw = await G(`/api/prop-checkouts/${chk1Id}`, director);
   check('换版不抹除领还流水', chk1AfterSw.checkout.id === chk1Id && chk1AfterSw.checkout.custodian.actorId === linId);
 
+  console.log('— 道具领用：首次回执冻结，归还/损坏/取消/改名后同号重试仍回放首次响应 —');
+  // 道具改名（灯笼）+ 时段取消（L2）均不改变冻结回执
+  await req('PATCH', `/api/props/${propLampL}`, director, { name: '领用灯笼E2E（已改名）' }, 200);
+  const chk1Live = await G(`/api/prop-checkouts/${chk1Id}`, director);
+  check('领用详情/责任清单展示最新状态：已改名、已归还清零',
+    chk1Live.checkout.status === 'cleared' && chk1Live.checkout.totalOutstanding === 0
+      && chk1Live.checkout.returns.length === 3
+      && chk1Live.checkout.items.find((i) => i.propId === propLampL).propName === '领用灯笼E2E（已改名）'
+      && chk1Live.checkout.items.find((i) => i.propId === propDrumL).returnedDamaged === 1,
+    JSON.stringify(chk1Live.checkout));
+  // 同号同内容重试（且明细顺序打乱）-> 200，checkout 与首次 201 响应逐字段一致
+  const chk1Frozen = await J(`/api/rehearsals/${rhL1}/schedules/${L1.id}/prop-checkouts`, director,
+    { ...chkBody, items: [chkBody.items[1], chkBody.items[0]] }, 200);
+  check('改名/归还/损坏后同号重试仍回放首次冻结回执（明细顺序差异视为同内容）',
+    chk1Frozen.ok === true && chk1Frozen.idempotentReplay === true
+      && JSON.stringify(chk1Frozen.checkout) === JSON.stringify(chk1.checkout)
+      && chk1Frozen.checkout.status === 'outstanding' && chk1Frozen.checkout.totalOutstanding === 3
+      && chk1Frozen.checkout.returns.length === 0
+      && chk1Frozen.checkout.schedule.status === 'active'
+      && chk1Frozen.checkout.items.find((i) => i.propId === propLampL).propName === '领用灯笼E2E'
+      && chk1Frozen.checkout.items.find((i) => i.propId === propLampL).outstanding === 2,
+    JSON.stringify({ frozen: chk1Frozen.checkout, first: chk1.checkout }));
+  // 周海 L2 的单：时段已取消（且稍后归还铃铛），重放仍是首次 active/未归还回执
+  const l2Replay = await J(`/api/rehearsals/${rhL2}/schedules/${L2.id}/prop-checkouts`, director,
+    { requestId: 'CHK-E2E-005', custodianActorId: zhouId,
+      items: [{ propId: propBellL, quantity: 1 }, { propId: propLampL, quantity: 1 }] }, 200);
+  check('已取消时段的同号重放仍为首次冻结回执（schedule.status=active、未归还 2）',
+    l2Replay.idempotentReplay === true && l2Replay.checkout.schedule.status === 'active'
+      && l2Replay.checkout.totalOutstanding === 2 && l2Replay.checkout.returns.length === 0,
+    JSON.stringify(l2Replay.checkout));
+  const l2Live = await G('/api/prop-checkouts', director);
+  check('责任清单继续展示实时状态（L2 已取消）',
+    l2Live.checkouts.find((c) => c.id === l2Replay.checkout.id).schedule.status === 'cancelled');
+
   console.log('— 道具领还：演员仅查看本人领还流水 / 下调库存守卫 —');
   const linFlow = await G('/api/me/prop-checkouts', lin);
-  check('演员查看本人领还流水（含归还记录）',
-    linFlow.checkouts.length === 1 && linFlow.checkouts[0].id === chk1Id
-      && linFlow.checkouts[0].returns.length === 3
-      && linFlow.checkouts[0].items.every((i) => i.outstanding === 0), JSON.stringify(linFlow));
+  check('演员查看本人领还流水（含归还记录；展示最新状态）',
+    linFlow.checkouts.length === 2
+      && linFlow.checkouts.some((c) => c.id === chk1Id && c.returns.length === 3
+        && c.items.every((i) => i.outstanding === 0)
+        && c.items.find((i) => i.propId === propLampL).propName === '领用灯笼E2E（已改名）')
+      && linFlow.checkouts.some((c) => c.id === failRetryId && c.totalOutstanding === 1),
+    JSON.stringify(linFlow));
   const zhouFlow = await G('/api/me/prop-checkouts', zhou);
   check('演员只见本人流水（周海不见林晚的单）',
     zhouFlow.checkouts.length === 1 && zhouFlow.checkouts.every((c) => c.custodian.actorId === zhouId)
